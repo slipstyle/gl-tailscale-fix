@@ -5,6 +5,10 @@ Maintainer: RemoteToHome Consulting <https://remotetohome.io>
 Section: net
 Priority: optional
 Description: Tailscale enhancements for GL.iNet routers
- Adds exit node advertisement, firewall kill switch, guest network
- routing, and Tailscale version management to the GL admin panel.
+ Adds features that complement GL's native Tailscale integration:
+ kernel-level policy-routing kill switch that survives tailscaled
+ crashes, guest network routing through the Tailscale exit node,
+ optional Tailscale SSH toggle for ACL-based authentication, and a
+ Tailscale binary version manager. On firmware 4.9+, the plugin
+ auto-adapts to coexist with GL's native Tailscale features.
  https://remotetohome.io/gl-tailscale-fix
