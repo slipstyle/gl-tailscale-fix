@@ -48,18 +48,32 @@ if [ -n "$fw_ver" ]; then
     fi
 fi
 
-# Migration from v1.0.18 (wrongly auto-disabled on 4.9+): on any upgrade
-# to a 4.9+ router, set a one-shot hint so the UI prompts the user to
-# re-enable Kill Switch. Fresh installs don't get the hint. The flag is
-# cleared automatically when the user enables KS via the UI, or by the
-# dismiss button. PKG_UPGRADE=1 is set by opkg on upgrade install.
-if [ "$PKG_UPGRADE" = "1" ] && [ "$is_fw49_plus" = "1" ]; then
-    if uci -q set ts-fix.settings.ks_upgrade_hint_pending=1 && uci commit ts-fix; then
-        logger -t ts-fix "Firmware $fw_ver upgrade — KS re-enable hint set"
-    else
-        # Log to syslog AND stderr so opkg output surfaces the failure.
-        # Without the hint, the user may not realise their KS needs re-enabling.
-        logger -t ts-fix -s "ERROR: failed to set ks_upgrade_hint_pending on $fw_ver upgrade — user may not see KS re-enable prompt"
+# Migration from v1.0.18 (which wiped KS functionality on 4.9+): set a
+# one-shot hint so the UI prompts the user to re-enable the Kill Switch.
+#
+# Signal: the `ks_upgrade_hint_pending` UCI field is new in v1.0.19. If
+# we're installing on a 4.9+ router and the preserved UCI doesn't have
+# that field, the user is on pre-v1.0.19 state — either via a normal
+# opkg upgrade (PKG_UPGRADE=1), or via a GL firmware upgrade that wiped
+# opkg's package status but left our files + UCI intact (the latter
+# matches the Reddit report 2026-04-21). Both paths need the hint.
+#
+# A genuinely fresh install copies /etc/config/ts-fix from the default
+# template (earlier block above), which includes the field at 0, so the
+# check below sees an empty value only when prior UCI was preserved.
+#
+# Fresh installs on 4.9+: field exists (= "0") → hint NOT set.
+# Pre-v1.0.19 UCI preserved: field empty → hint set.
+if [ "$is_fw49_plus" = "1" ]; then
+    hint_field=$(uci -q get ts-fix.settings.ks_upgrade_hint_pending)
+    if [ -z "$hint_field" ]; then
+        if uci -q set ts-fix.settings.ks_upgrade_hint_pending=1 && uci commit ts-fix; then
+            logger -t ts-fix "Pre-v1.0.19 UCI detected on firmware $fw_ver — KS re-enable hint set"
+        else
+            # Log to syslog AND stderr so opkg output surfaces the failure.
+            # Without the hint, the user may not realise their KS needs re-enabling.
+            logger -t ts-fix -s "ERROR: failed to set ks_upgrade_hint_pending on $fw_ver upgrade — user may not see KS re-enable prompt"
+        fi
     fi
 fi
 
