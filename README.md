@@ -16,6 +16,7 @@ Tailscale admin console walkthrough.
   traffic at the kernel routing layer, before conntrack and firewall evaluation.
   Prevents even established connections from leaking when the exit node drops.
   Persists through daemon crashes, OOM kills, reboots, and service restarts.
+  Covers both IPv4 and IPv6 (v1.0.20+).
 - **Advertise as Exit Node** — GUI toggle for `tailscale set
   --advertise-exit-node`. No SSH or script modification required.
 - **Guest Network Access** — bidirectional firewall forwardings between guest
@@ -52,8 +53,16 @@ Tailscale admin console walkthrough.
 - **Subnet Routing Fix** — automatically enables masquerade on the tailscale0
   firewall zone. Tailscale's built-in SNAT can fail to reinitialize after daemon
   restart, particularly on fw3 (iptables) kernels, causing cross-subnet LAN
-  traffic from client devices to break. The masquerade provides defense-in-depth
-  SNAT at the firewall layer. Applied automatically — no user action required.
+  traffic from client devices to break. Plugin sets `masq` and `masq6` on
+  tailscale0 for defense-in-depth SNAT covering both IPv4 and IPv6. On pre-4.9
+  firmware acting as an exit node, the plugin also sets `wan.masq6` — on fw3
+  (iptables) kernels this is required because Tailscale's own IPv6 SNAT chain
+  is empty there, so without `wan.masq6` tailnet clients using this router as
+  an IPv6 exit node would have their v6 traffic silently dropped while v4
+  worked fine; on fw4 pre-4.9 the value is usually already set by GL, so the
+  helper is a no-op. On firmware 4.9+ the plugin defers all masquerade
+  management to GL's native "IP Masquerading" toggle. Applied automatically —
+  no user action required.
 - **Clean integration** — no GL scripts or binaries are altered from their
   factory state. If a modified `gl_tailscale` wrapper is detected during
   installation (e.g. a manual `--advertise-exit-node` modification), the
@@ -240,6 +249,15 @@ survives `tailscaled` crashes that Tailscale's built-in kill switch cannot.
 See the [blog post](https://remotetohome.io/blog/gl-tailscale-fix/) for the
 kill-switch rationale.
 
+Starting with **v1.0.20** the kill switch and the tailscale0 masquerade
+fixes apply to IPv6 as well as IPv4. On firmware 4.9+ the plugin no longer
+overrides GL's masquerade settings — if you have both **IP Masquerading**
+and **Allow Remote Access LAN** turned off on the Tailscale page, GL may
+leave the tailscale0 zone without IPv6 masquerade, in which case LAN-side
+IPv6 will not traverse the exit-node tunnel. Enable either setting and
+IPv6 works. The kill switch still protects on 4.9 regardless of masquerade
+state.
+
 See the [tested models](#tested-models) appendix for the full compatibility matrix.
 
 ## Disclaimer
@@ -285,8 +303,8 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 
 | Model | Device | FW | OpenWrt | Firewall | Plugin | Tailscale |
 |-------|--------|----|--------|----------|--------|-----------|
-| GL-AXT1800 | Slate AX | 4.8.3 | 23.05 | fw4 | v1.0.19 ✓✓ | 1.80.3 / 1.96.4 |
-| GL-MT3000 | Beryl AX | 4.9.0 | 21.02-SNAPSHOT | fw3 | v1.0.19 ✓✓ | 1.92.5 / 1.96.4 |
+| GL-AXT1800 | Slate AX | 4.8.4 | 23.05 | fw4 | v1.0.20 ✓✓✓ | 1.80.3 / 1.96.4 |
+| GL-MT3000 | Beryl AX | 4.9.0 | 21.02-SNAPSHOT | fw3 | v1.0.20 ✓✓✓ | 1.92.5 / 1.96.4 |
 | GL-MT3000 | Beryl AX | 4.8.2 | 21.02 | fw3 | v1.0.18 | 1.80.3 / 1.94.2 |
 | GL-AX1800 | Flint | 4.6.8 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
 | GL-MT2500 | Brume 2 | 4.7.4 | 21.02 | fw3 | v1.0.5 † | 1.66.4 |
@@ -304,6 +322,7 @@ Commercial licensing available for closed source use — contact [remotetohome.i
 **¶** Install + version manager verified.
 **✓** Full e2e: exit node server + client, kill switch, version manager.
 **✓✓** Full e2e on v1.0.19, including 4.9.0 daemon-stopped leak-block test (zero leak).
+**✓✓✓** Full e2e on v1.0.20, adding IPv6 KS leak-block test (zero leak both families) and exit-node-server SNAT for both IPv4 and IPv6.
 **⊕** Community install + functional confirmation ([forum](https://forum.gl-inet.com/t/enhanced-tailscale-for-gl-inet-routers-proper-ts-killswitch-one-click-exit-node/67565)).
 **§** Install on 4.5.22 + 4.7.2β; KS verified on 4.7.2β; version manager unsupported ([#6](https://github.com/RemoteToHome-io/gl-tailscale-fix/issues/6)).
 

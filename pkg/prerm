@@ -3,6 +3,22 @@
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
+# Detect GL firmware 4.9+ (inline — prerm doesn't source other files).
+# On 4.9+, GL owns the tailscale0 IP Masquerading toggle natively, so the
+# plugin should never delete those UCI fields (would trample GL's state).
+is_fw49_plus() {
+    local fw_ver major minor
+    fw_ver=$(awk '{print $1}' /etc/glversion 2>/dev/null)
+    [ -z "$fw_ver" ] && return 1
+    major=$(echo "$fw_ver" | cut -d. -f1)
+    minor=$(echo "$fw_ver" | cut -d. -f2)
+    if [ "$major" -gt 4 ] 2>/dev/null || \
+       { [ "$major" -eq 4 ] && [ "$minor" -ge 9 ]; } 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # Always preserve config so postinst can restore it after reinstall.
 # opkg --force-reinstall does NOT set PKG_UPGRADE=1, so the teardown
 # below would destroy user settings. Saving to /tmp lets postinst
@@ -25,20 +41,44 @@ fi
 pgrep tailscaled >/dev/null 2>&1 && \
     /usr/sbin/tailscale set --advertise-exit-node=false --ssh=false 2>/dev/null
 
-# Remove kill switch routing rules
-ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-ip route del unreachable default table 100 2>/dev/null
+# Remove kill switch routing rules (both address families)
+for fam in -4 -6; do
+    ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+    ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+    ip $fam route del unreachable default table 100 2>/dev/null
+done
 
 # Remove guest subnet policy route fixup
 _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
 [ -n "$_gs" ] && ip rule del to "$_gs" table main 2>/dev/null
 
-# Remove guest routing firewall forwardings, masquerade, and legacy kill switch rules
+# Remove guest routing firewall forwardings and legacy kill switch rules
 for section in ts_fix_guest2ts ts_fix_ts2guest ts_ks_lan2wan ts_ks_guest2wan; do
     uci -q delete firewall."$section" 2>/dev/null
 done
-uci -q delete firewall.tailscale0.masq 2>/dev/null
+
+# Remove tailscale0 zone masq/masq6 — only on pre-4.9 where we set them.
+# On 4.9+, GL owns the IP Masquerading toggle natively and may have set
+# them itself; deleting would trample GL's state.
+if ! is_fw49_plus; then
+    uci -q delete firewall.tailscale0.masq 2>/dev/null
+    uci -q delete firewall.tailscale0.masq6 2>/dev/null
+fi
+
+# If we set wan.masq6 for exit-node-server (sidecar flag), undo it by
+# DELETING the option (returns to truly-unset state — preserves the
+# distinction between "user explicitly set 0" and "option not present",
+# matching the runtime helper's teardown semantics). Skip silently if
+# flag isn't set: we never set it, so we never unset it.
+if [ "$(uci -q get ts-fix.settings.wan_masq6_set_by_plugin)" = "1" ]; then
+    for _s in $(uci -q show firewall 2>/dev/null | grep "=zone$" | cut -d= -f1 | sed 's/^firewall\.//'); do
+        if [ "$(uci -q get firewall.$_s.name 2>/dev/null)" = "wan" ]; then
+            uci -q delete "firewall.$_s.masq6"
+            break
+        fi
+    done
+fi
+
 uci commit firewall 2>/dev/null
 /etc/init.d/firewall reload 2>/dev/null
 

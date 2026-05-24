@@ -205,11 +205,18 @@ local function ensure_masquerade()
         ngx.log(ngx.WARN, "ts-fix: tailscale0 firewall zone not found — masquerade not configured")
         return false
     end
-    if c:get(FW_CONFIG, "tailscale0", "masq") == "1" then
-        return true  -- already set
+    -- Both IPv4 (masq) and IPv6 (masq6) masquerade are set on the tailscale0
+    -- zone. Verified empirically: without masq6, forwarded LAN IPv6 fails to
+    -- traverse the exit-node tunnel. masq6 provides the IPv6 SNAT, mirroring
+    -- masq's defense-in-depth role for IPv4.
+    if c:get(FW_CONFIG, "tailscale0", "masq") == "1"
+       and c:get(FW_CONFIG, "tailscale0", "masq6") == "1" then
+        return true  -- both already set
     end
-    if not c:set(FW_CONFIG, "tailscale0", "masq", "1") then
-        ngx.log(ngx.ERR, "ts-fix: failed to set firewall.tailscale0.masq")
+    local ok = c:set(FW_CONFIG, "tailscale0", "masq", "1")
+    ok = c:set(FW_CONFIG, "tailscale0", "masq6", "1") and ok
+    if not ok then
+        ngx.log(ngx.ERR, "ts-fix: failed to set firewall.tailscale0 masquerade")
         return false
     end
     if not c:commit(FW_CONFIG) then
@@ -218,6 +225,79 @@ local function ensure_masquerade()
     end
     ngx.pipe.spawn({"/etc/init.d/firewall", "reload"})
     return true
+end
+
+-- Helper: find the firewall zone section whose .name='wan'. Stock GL
+-- configs use anonymous sections (e.g. @zone[1]) so we can't c:get by
+-- "wan" directly — iterate to locate it. Returns the section name
+-- (e.g. "cfg033f8e" or "wan" for a named section) or nil.
+-- First-match: if a misconfigured firewall has duplicate name='wan' zones,
+-- act on the first (the iptables/nft chain GL's `wan` zone resolves to)
+-- rather than the last — last-wins could land on a stale/duplicate section
+-- with a different chain name. Red-team 2026-05-23.
+local function find_wan_zone_section(c)
+    local result = nil
+    c:foreach(FW_CONFIG, "zone", function(s)
+        if result == nil and s.name == "wan" then
+            result = s[".name"]
+        end
+    end)
+    return result
+end
+
+-- Helper: ensure wan-zone IPv6 masquerade when this router is acting as a
+-- Tailscale exit node. Closes the pre-4.9 fw3 gap where Tailscale's own
+-- ts-postrouting IPv6 chain is empty (verified empirically) AND pre-4.9
+-- GL firmware doesn't reliably auto-set wan.masq6. Without it, forwarded
+-- tailnet IPv6 (source fd7a:115c:a1e0::/48) exits with the ULA source
+-- intact and is dropped upstream — silent IPv6 failure for tailnet clients
+-- trying to use this router as an IPv6 exit node.
+--
+-- Sidecar flag ts-fix.settings.wan_masq6_set_by_plugin records whether WE
+-- set masq6, so teardown only unsets it if our flag is on — never
+-- trampling a GL- or user-managed value.
+local function ensure_wan_v6_masq_for_exit_node(advertise_on)
+    local c = uci.cursor()
+    local wan_sec = find_wan_zone_section(c)
+    if not wan_sec then
+        ngx.log(ngx.WARN, "ts-fix: wan zone not found — exit-node v6 masquerade not configured")
+        return
+    end
+    -- cur is nil (option not present), "" (rare), "0" (explicit off),
+    -- or "1" (on). We distinguish "truly unset" from "user explicitly 0"
+    -- so we don't trample a user's deliberate override (red-team 2026-05-23).
+    local cur = c:get(FW_CONFIG, wan_sec, "masq6")
+    local flag = c:get(TS_FIX_CONFIG, "settings", "wan_masq6_set_by_plugin") == "1"
+    local changed = false
+    if advertise_on then
+        if not cur or cur == "" then
+            -- masq6 truly unset → safe to set (user hasn't expressed intent)
+            c:set(FW_CONFIG, wan_sec, "masq6", "1")
+            c:set(TS_FIX_CONFIG, "settings", "wan_masq6_set_by_plugin", "1")
+            changed = true
+        elseif cur == "0" and flag then
+            -- User explicitly set masq6=0 after we set it to 1. Respect the
+            -- override: release ownership (clear our flag) but leave their 0.
+            c:set(TS_FIX_CONFIG, "settings", "wan_masq6_set_by_plugin", "0")
+            changed = true
+        end
+        -- If cur="0" with flag=0: user/GL chose 0, don't reclaim.
+        -- If cur="1": no-op regardless of flag.
+    else
+        if flag then
+            -- We previously set it. Delete the option (back to unset state)
+            -- rather than setting to "0" — preserves the distinction between
+            -- "user explicitly 0" and "option not present".
+            c:delete(FW_CONFIG, wan_sec, "masq6")
+            c:set(TS_FIX_CONFIG, "settings", "wan_masq6_set_by_plugin", "0")
+            changed = true
+        end
+    end
+    if changed then
+        c:commit(FW_CONFIG)
+        c:commit(TS_FIX_CONFIG)
+        ngx.pipe.spawn({"/etc/init.d/firewall", "reload"})
+    end
 end
 
 -- Helper: fix guest subnet policy route for exit node compatibility.
@@ -242,29 +322,34 @@ local function fix_guest_policy_route(enabled)
     end
 end
 
--- Helper: set kill switch routing rules (ip rule + ip route)
+-- Helper: set kill switch routing rules (ip rule + ip route), both families.
 -- Uses policy routing instead of firewall rules to block before conntrack.
 -- Table 100 = unreachable default, priority 5280 = after Tailscale's 5270.
+-- Applied to IPv4 and IPv6. "ip -6" errors are suppressed: if IPv6 is
+-- compiled out the calls fail; if IPv6 is merely disabled the rules install
+-- inert (no IPv6 traffic to act on). Neither case is harmful.
 local function set_killswitch_route(enabled)
-    if enabled then
-        -- Ensure table 100 has unreachable default
-        local rt = exec("ip route show table 100 2>/dev/null") or ""
-        if not rt:match("unreachable default") then
-            exec("ip route add unreachable default table 100")
+    for _, fam in ipairs({"-4", "-6"}) do
+        if enabled then
+            -- Ensure table 100 has unreachable default
+            local rt = exec("ip " .. fam .. " route show table 100 2>/dev/null") or ""
+            if not rt:match("unreachable default") then
+                exec("ip " .. fam .. " route add unreachable default table 100 2>/dev/null")
+            end
+            -- Add ip rules for br-lan and br-guest (idempotent)
+            local rules = exec("ip " .. fam .. " rule list priority 5280 2>/dev/null") or ""
+            if not rules:match("iif br%-lan") then
+                exec("ip " .. fam .. " rule add iif br-lan priority 5280 lookup 100 2>/dev/null")
+            end
+            if not rules:match("iif br%-guest") then
+                exec("ip " .. fam .. " rule add iif br-guest priority 5280 lookup 100 2>/dev/null")
+            end
+        else
+            -- Remove ip rules and route (suppress errors if not present)
+            exec("ip " .. fam .. " rule del iif br-lan priority 5280 lookup 100 2>/dev/null")
+            exec("ip " .. fam .. " rule del iif br-guest priority 5280 lookup 100 2>/dev/null")
+            exec("ip " .. fam .. " route del unreachable default table 100 2>/dev/null")
         end
-        -- Add ip rules for br-lan and br-guest (idempotent)
-        local rules = exec("ip rule list priority 5280 2>/dev/null") or ""
-        if not rules:match("iif br%-lan") then
-            exec("ip rule add iif br-lan priority 5280 lookup 100")
-        end
-        if not rules:match("iif br%-guest") then
-            exec("ip rule add iif br-guest priority 5280 lookup 100")
-        end
-    else
-        -- Remove ip rules and route (suppress errors if not present)
-        exec("ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null")
-        exec("ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null")
-        exec("ip route del unreachable default table 100 2>/dev/null")
     end
 end
 
@@ -307,9 +392,13 @@ local firmware_version, fw_is_49_plus = detect_firmware()
 function M.get_config()
     -- Ensure masquerade on every config read (covers first page visit after
     -- install, even if no ts-fix features are active — needed for LAN clients
-    -- to reach Tailscale peers through subnet routing). Defense-in-depth on
-    -- all firmware, including 4.9+ where it coexists with GL's native toggle.
-    ensure_masquerade()
+    -- to reach Tailscale peers through subnet routing). On 4.9+, GL owns the
+    -- IP Masquerading toggle natively (under NAT on the Tailscale page) —
+    -- defer entirely to avoid fighting the UI in the narrow edge case where
+    -- the user has both LAN access and the masq toggle off.
+    if not fw_is_49_plus then
+        ensure_masquerade()
+    end
 
     local c = uci.cursor()
     local res = {}
@@ -359,15 +448,23 @@ function M.get_config()
     -- nginx restart).
     res.ts_version = get_ts_version()
 
-    -- Kill switch routing rule state (ip rules for table 100 at priority 5280)
-    local ks_rules = exec("ip rule list priority 5280 2>/dev/null") or ""
-    res.kill_switch_fw_active = ks_rules:match("lookup 100") ~= nil
+    -- Kill switch routing rule state — checked per family (IPv4 + IPv6).
+    -- Reported active only when BOTH families' rules are present; a torn
+    -- state (one family only, e.g. a partial reapply) reports false so the
+    -- UI prompts a re-apply rather than silently claiming full protection.
+    local ks_v4 = (exec("ip -4 rule list priority 5280 2>/dev/null") or ""):match("lookup 100") ~= nil
+    local ks_v6 = (exec("ip -6 rule list priority 5280 2>/dev/null") or ""):match("lookup 100") ~= nil
+    res.kill_switch_fw_active = ks_v4 and ks_v6
 
     -- Guest routing firewall forwarding state
     res.route_guest_fw_active = c:get(FW_CONFIG, "ts_fix_guest2ts") ~= nil
 
-    -- Tailscale0 zone masquerade state
+    -- Tailscale0 zone masquerade state — reported active only when BOTH
+    -- families' masquerade are set (mirrors kill_switch_fw_active semantics;
+    -- a torn state surfaces in the UI rather than silently claiming
+    -- protection).
     res.masquerade_active = c:get(FW_CONFIG, "tailscale0", "masq") == "1"
+        and c:get(FW_CONFIG, "tailscale0", "masq6") == "1"
 
     return res
 end
@@ -445,6 +542,10 @@ function M.set_config(params)
         else
             exec("/usr/sbin/tailscale set --advertise-exit-node=false 2>/dev/null")
         end
+        -- Ensure wan-zone IPv6 masquerade so tailnet clients can use this
+        -- router as an IPv6 exit node. Closes pre-4.9 fw3 gap where
+        -- Tailscale's own ts-postrouting v6 chain is empty.
+        ensure_wan_v6_masq_for_exit_node(advertise)
     end
 
     -- Apply SSH setting (only when it was actually changed)
@@ -467,8 +568,11 @@ function M.set_config(params)
         fix_guest_policy_route(rg)
     end
 
-    -- Ensure tailscale0 zone masquerade (defense-in-depth for subnet routing)
-    ensure_masquerade()
+    -- Ensure tailscale0 zone masquerade (defense-in-depth for subnet routing).
+    -- On 4.9+, GL owns this — defer (see comment in get_config).
+    if not fw_is_49_plus then
+        ensure_masquerade()
+    end
 
     return {}
 end

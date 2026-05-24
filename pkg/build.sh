@@ -57,7 +57,10 @@ install -m 755 "$ROOT_DIR/src/init.d/ts-fix" "$DATA/etc/init.d/ts-fix"
 install -d "$DATA/etc/nginx/gl-conf.d"
 install -m 644 "$ROOT_DIR/src/nginx/ts-fix.conf" "$DATA/etc/nginx/gl-conf.d/ts-fix.conf"
 install -d "$DATA/usr/share/ts-fix"
-install -m 644 "$ROOT_DIR/src/nginx/ts-fix-body-filter.lua" "$DATA/usr/share/ts-fix/ts-fix-body-filter.lua"
+# Body filter: substitute {{VERSION}} in the injected <script> tag URL so
+# browsers refetch ts-fix.js after a plugin upgrade (cache-busting).
+sed "s/{{VERSION}}/$VERSION/" "$ROOT_DIR/src/nginx/ts-fix-body-filter.lua" > "$BUILD_DIR/ts-fix-body-filter.lua"
+install -m 644 "$BUILD_DIR/ts-fix-body-filter.lua" "$DATA/usr/share/ts-fix/ts-fix-body-filter.lua"
 install -m 644 "$ROOT_DIR/src/nginx/ts-fix-header-filter.lua" "$DATA/usr/share/ts-fix/ts-fix-header-filter.lua"
 
 # Frontend JS (version-stamped + gzipped — nginx has gzip_static on)

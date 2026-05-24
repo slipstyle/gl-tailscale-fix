@@ -24,6 +24,75 @@ is_fw49_plus() {
     return 1
 }
 
+# Find the firewall zone section whose .name='wan'. Stock GL configs use
+# anonymous sections (e.g. @zone[1]) so we iterate to locate it. Echoes
+# the section name (e.g. "@zone[1]" or "cfg033f8e") on success, nothing
+# on failure (caller treats empty as "no wan zone, skip").
+find_wan_zone_section() {
+    local s
+    for s in $(uci -q show firewall 2>/dev/null | grep "=zone$" | cut -d= -f1 | sed 's/^firewall\.//'); do
+        if [ "$(uci -q get firewall.$s.name 2>/dev/null)" = "wan" ]; then
+            echo "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Ensure wan-zone IPv6 masquerade when this router is acting as a Tailscale
+# exit node. Closes the pre-4.9 fw3 gap: Tailscale's own v6 SNAT chain is
+# empty on iptables/fw3 (verified empirically) AND pre-4.9 GL firmware
+# doesn't reliably set wan.masq6. Without it, forwarded tailnet IPv6 exits
+# with the Tailscale ULA source intact and is dropped upstream — silent
+# IPv6 failure for tailnet clients trying to use this router as exit node.
+# Idempotent. Sidecar flag ts-fix.settings.wan_masq6_set_by_plugin tracks
+# whether WE set masq6, so teardown only unsets it if our flag is on —
+# never trampling a GL- or user-managed value.
+#
+# Distinguishes "option not present" (cur empty) from "user explicit 0"
+# (cur="0"). Only sets when truly unset; teardown uses `uci -q delete`
+# instead of setting 0, so we don't fabricate a value that wasn't there.
+# If user explicitly overrides our 1→0 after we set it, we release
+# ownership (clear our flag) and respect their 0. Red-team 2026-05-23.
+#
+#   $1: "1" to ensure on, "0" to (conditionally) restore
+ensure_wan_v6_masq_for_exit_node() {
+    local on=$1 wan_sec cur flag changed=0
+    wan_sec=$(find_wan_zone_section)
+    [ -z "$wan_sec" ] && return 0
+    cur=$(uci -q get "firewall.$wan_sec.masq6")
+    flag=$(uci -q get ts-fix.settings.wan_masq6_set_by_plugin)
+    if [ "$on" = "1" ]; then
+        if [ -z "$cur" ]; then
+            # masq6 truly unset → safe to set (user hasn't expressed intent)
+            uci set "firewall.$wan_sec.masq6=1"
+            uci set ts-fix.settings.wan_masq6_set_by_plugin=1
+            changed=1
+        elif [ "$cur" = "0" ] && [ "$flag" = "1" ]; then
+            # User explicitly set masq6=0 after we set it to 1. Respect the
+            # override: release ownership (clear our flag), leave their 0.
+            uci set ts-fix.settings.wan_masq6_set_by_plugin=0
+            changed=1
+        fi
+        # cur="0" with flag=0: user/GL chose 0, don't reclaim.
+        # cur="1": no-op regardless of flag.
+    else
+        if [ "$flag" = "1" ]; then
+            # We previously set it. Delete the option (back to unset state)
+            # rather than setting "0" — preserves the distinction between
+            # "user explicitly 0" and "option not present".
+            uci -q delete "firewall.$wan_sec.masq6"
+            uci set ts-fix.settings.wan_masq6_set_by_plugin=0
+            changed=1
+        fi
+    fi
+    if [ "$changed" = "1" ]; then
+        uci commit firewall
+        uci commit ts-fix
+        /etc/init.d/firewall reload >/dev/null 2>&1
+    fi
+}
+
 enabled=$(uci -q get tailscale.settings.enabled)
 
 # If Tailscale is disabled, tear down all ts-fix state and exit.
@@ -32,10 +101,12 @@ enabled=$(uci -q get tailscale.settings.enabled)
 # be cleaned up, and UCI settings reset to 0 so everything starts clean
 # when Tailscale is re-enabled.
 if [ "$enabled" != "1" ]; then
-    # Remove kill switch routing rules
-    ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-    ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-    ip route del unreachable default table 100 2>/dev/null
+    # Remove kill switch routing rules (both address families)
+    for fam in -4 -6; do
+        ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+        ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+        ip $fam route del unreachable default table 100 2>/dev/null
+    done
 
     # Remove guest policy route fixup
     _gs=$(ip -4 addr show br-guest 2>/dev/null | awk '/inet /{print $2}' | sed 's|\.[0-9]*/|.0/|')
@@ -69,11 +140,21 @@ if [ "$enabled" != "1" ]; then
         uci -q delete firewall.ts_fix_ts2guest
         _fw=1
     }
-    [ "$(uci -q get firewall.tailscale0.masq)" = "1" ] && {
-        uci -q delete firewall.tailscale0.masq
-        _fw=1
-    }
+    # On 4.9+, GL owns the IP Masquerading toggle — don't delete on teardown
+    # (would trample GL's state). On pre-4.9, plugin set them, plugin clears.
+    if ! is_fw49_plus; then
+        if [ "$(uci -q get firewall.tailscale0.masq)" = "1" ] || \
+           [ "$(uci -q get firewall.tailscale0.masq6)" = "1" ]; then
+            uci -q delete firewall.tailscale0.masq
+            uci -q delete firewall.tailscale0.masq6
+            _fw=1
+        fi
+    fi
     [ "$_fw" = "1" ] && { uci commit firewall; /etc/init.d/firewall reload; }
+
+    # If we set wan.masq6 for exit-node-server, restore it. Idempotent no-op
+    # unless our sidecar flag is set, so we never trample a GL/user value.
+    ensure_wan_v6_masq_for_exit_node 0
 
     # Disable Tailscale SSH (pgrep guard — avoids spawning Go process if daemon already stopped)
     pgrep tailscaled >/dev/null 2>&1 && /usr/sbin/tailscale set --ssh=false 2>/dev/null
@@ -96,9 +177,14 @@ flock -n 200 || exit 0
 # Ensure tailscale0 zone masquerade BEFORE waiting for tailscaled — this is a
 # pure firewall setting that doesn't need the daemon. Required for LAN clients
 # to reach Tailscale peers through subnet routing (SNAT return path).
-if [ -n "$(uci -q get firewall.tailscale0)" ]; then
-    if [ "$(uci -q get firewall.tailscale0.masq)" != "1" ]; then
+# On 4.9+, GL owns the IP Masquerading toggle natively — defer to it (don't
+# fight the UI in the narrow edge case where the user has both LAN access
+# off and the masq toggle off).
+if ! is_fw49_plus && [ -n "$(uci -q get firewall.tailscale0)" ]; then
+    if [ "$(uci -q get firewall.tailscale0.masq)" != "1" ] || \
+       [ "$(uci -q get firewall.tailscale0.masq6)" != "1" ]; then
         uci set firewall.tailscale0.masq=1
+        uci set firewall.tailscale0.masq6=1
         uci commit firewall
         /etc/init.d/firewall reload >/dev/null 2>&1
     fi
@@ -146,6 +232,57 @@ done
 adv=$(uci -q get ts-fix.settings.advertise_exit_node)
 if [ "$adv" = "1" ] && ! is_fw49_plus; then
     /usr/sbin/tailscale set --advertise-exit-node 2>/dev/null
+fi
+
+# Ensure wan-zone IPv6 masquerade when this router is acting as a Tailscale
+# exit node (closes pre-4.9 fw3 gap where Tailscale's own v6 SNAT chain is
+# empty + pre-4.9 GL doesn't reliably set wan.masq6). Scoped to pre-4.9 —
+# on 4.9+ GL owns the exit-node surface. The "off" branch is a safety net
+# that restores wan.masq6 if a previous pre-4.9 install set it and the
+# router is no longer acting as exit node (e.g. firmware upgraded to 4.9
+# while advertise_exit_node was on; sidecar flag persists in UCI and we
+# unwind on the next reapply).
+if [ "$adv" = "1" ] && ! is_fw49_plus; then
+    ensure_wan_v6_masq_for_exit_node 1
+else
+    ensure_wan_v6_masq_for_exit_node 0
+fi
+
+# Item 2: GL 4.9 Custom Exit Node reconciliation (defensive).
+# PLAN observed 2026-04-24 that GL 4.9's Apply sometimes set
+# `tailscale.settings.exit_node_ip` UCI without actually running
+# `tailscale set --exit-node=<ip>` — daemon ended up with empty
+# ExitNodeID, no table-52 default, user saw real IP. Pre-check
+# 2026-05-23 couldn't reproduce via `gl_tailscale restart` on MT3000
+# 4.9.0 (firmware unchanged per user — likely Tailscale binary update
+# or environmental factor changed since). Defensive reconcile catches
+# it if it reappears.
+#
+# Safety: value-snapshot signal. Track `last_seen_exit_node_ip` in
+# our own UCI. Reconcile only when the user's UCI exit_node_ip is a
+# NEW value (changed since our last reapply) AND daemon is empty AND
+# the value is non-empty. Avoids the re-enable failure mode where
+# unrelated GL Tailscale UCI commits bump /etc/config/tailscale mtime
+# while exit_node_ip is stale from a past use. (Red-team 2026-05-23
+# flagged the earlier mtime-only gate as insufficient — mtime doesn't
+# isolate "exit_node_ip changed" from "any UCI key in this file changed".)
+if is_fw49_plus; then
+    gl_exit_ip=$(uci -q get tailscale.settings.exit_node_ip)
+    ts_exit_id=$(/usr/sbin/tailscale debug prefs 2>/dev/null | jsonfilter -e '@.ExitNodeID' 2>/dev/null)
+    last_seen=$(uci -q get ts-fix.settings.last_seen_exit_node_ip)
+    if [ "$gl_exit_ip" != "$last_seen" ]; then
+        # exit_node_ip value changed since our last reapply.
+        if [ -n "$gl_exit_ip" ] && [ -z "$ts_exit_id" ]; then
+            # New non-empty UCI but daemon hasn't caught up → reconcile.
+            logger -t ts-fix "4.9 reconcile: UCI exit_node_ip changed to $gl_exit_ip but daemon ExitNodeID empty — running tailscale set --exit-node"
+            /usr/sbin/tailscale set --exit-node="$gl_exit_ip" 2>/dev/null
+        fi
+        # Record current UCI value as our "last seen" regardless of
+        # whether we reconciled. Next reapply with the SAME value is
+        # treated as "no change, don't touch the daemon."
+        uci set ts-fix.settings.last_seen_exit_node_ip="$gl_exit_ip"
+        uci commit ts-fix
+    fi
 fi
 
 # Re-apply Tailscale SSH (skip false — already cleared by --reset)
@@ -256,17 +393,28 @@ if [ "$kill_switch" = "1" ] && [ -z "$exit_node_id" ] && [ -z "$gl_exit_ip" ]; t
 fi
 
 if [ "$kill_switch" = "1" ] && [ -n "$exit_node_id" ]; then
-    # Ensure table 100 has unreachable default
-    ip route show table 100 2>/dev/null | grep -q "unreachable default" || \
-        ip route add unreachable default table 100
-    # Add ip rules for br-lan and br-guest (idempotent)
-    ip rule list priority 5280 2>/dev/null | grep -q "iif br-lan" || \
-        ip rule add iif br-lan priority 5280 lookup 100
-    ip rule list priority 5280 2>/dev/null | grep -q "iif br-guest" || \
-        ip rule add iif br-guest priority 5280 lookup 100
+    # Install kill switch routing rules for both address families.
+    # "ip -6" errors are suppressed — harmless if IPv6 is compiled out
+    # (calls fail) or merely disabled (rules install inert).
+    for fam in -4 -6; do
+        # Ensure table 100 has unreachable default
+        ip $fam route show table 100 2>/dev/null | grep -q "unreachable default" || \
+            ip $fam route add unreachable default table 100 2>/dev/null
+        # Add ip rules for br-lan and br-guest (idempotent)
+        ip $fam rule list priority 5280 2>/dev/null | grep -q "iif br-lan" || \
+            ip $fam rule add iif br-lan priority 5280 lookup 100 2>/dev/null
+        ip $fam rule list priority 5280 2>/dev/null | grep -q "iif br-guest" || \
+            ip $fam rule add iif br-guest priority 5280 lookup 100 2>/dev/null
+    done
 else
-    # Remove kill switch routing rules (suppress errors if not present)
-    ip rule del iif br-lan priority 5280 lookup 100 2>/dev/null
-    ip rule del iif br-guest priority 5280 lookup 100 2>/dev/null
-    ip route del unreachable default table 100 2>/dev/null
+    # Remove kill switch routing rules, both families (suppress errors)
+    for fam in -4 -6; do
+        ip $fam rule del iif br-lan priority 5280 lookup 100 2>/dev/null
+        ip $fam rule del iif br-guest priority 5280 lookup 100 2>/dev/null
+        ip $fam route del unreachable default table 100 2>/dev/null
+    done
 fi
+
+# Explicit success — the trailing "ip ... del" returns rc 2 when the rules
+# are already absent (normal KS-off path); don't propagate that as failure.
+exit 0

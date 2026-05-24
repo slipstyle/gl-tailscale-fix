@@ -9,15 +9,24 @@
 # Copyright (c) 2026 RemoteToHome Consulting (https://remotetohome.io)
 # https://github.com/RemoteToHome-io/gl-tailscale-fix
 
-prev=$(uci -q get tailscale.settings.enabled)
+# State tracking removed — the TS-disabled check below is now idempotent
+# (fires on any poll where TS is off AND KS rules are still installed),
+# catching both the normal 1→0 transition AND the fast 1→0→1 sequence
+# where the prior transition-based check silently missed the disable.
+# Verified empirically 2026-04-25 on AXT1800 4.8.3 v1.0.19: three rapid
+# disable→re-enable cycles within one 5s poll window, only one teardown
+# logged with the old logic.
 
 while true; do
     sleep 5
     curr=$(uci -q get tailscale.settings.enabled)
 
-    # Detect Tailscale disabled
-    if [ "$prev" = "1" ] && [ "$curr" != "1" ]; then
-        logger -t ts-fix "Tailscale disabled — running teardown"
+    # Detect Tailscale disabled + KS rules still installed → run teardown.
+    # Idempotent: keeps firing until teardown clears the KS rules (which
+    # reapply does on its first invocation; subsequent polls see no rules
+    # and no-op). Replaces the prior transition-based check.
+    if [ "$curr" != "1" ] && ip rule list 2>/dev/null | grep -q "5280.*lookup 100"; then
+        logger -t ts-fix "Tailscale disabled + KS rules present — running teardown"
         /usr/bin/ts-fix-reapply
     fi
 
@@ -51,5 +60,4 @@ while true; do
         fi
     fi
 
-    prev="$curr"
 done
