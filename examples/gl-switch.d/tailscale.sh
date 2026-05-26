@@ -69,6 +69,12 @@
 # slider "off" as "disable everything." If you prefer the inverted convention (resting
 # position is "off" with Tailscale active), swap the action names in the if/elif branches.
 #
+# To verify which physical slider position your router reports as "on", SSH in and run:
+#   . /lib/functions/gl_util.sh; get_switch_button_status
+# It prints the literal string "on" or "off". Flip the slider, run again, compare. GL
+# handles per-model GPIO polarity quirks inside that function, so the semantic is
+# portable across hardware.
+#
 # Released under the same terms as gl-tailscale-fix (GPL-3.0).
 
 # --- Configuration ---
