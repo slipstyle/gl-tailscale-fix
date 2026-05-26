@@ -4,6 +4,22 @@
 # preferences together via the physical side switch on supported GL.iNet
 # routers (Beryl AX, Slate AX, etc.).
 #
+# Prerequisites — verify all of these BEFORE deploying this script:
+#   1. gl-tailscale-fix v1.0.9 or later installed on the router.
+#   2. Tailscale enabled in the GL admin UI at least once and bound to
+#      your Tailscale account ("Bind Account" set).
+#   3. A Custom Exit Node selected at least once in the GL UI (so an
+#      exit node IP is stored in tailscale.settings.exit_node_ip — the
+#      script reuses GL's most recent selection on each "on" flip).
+#   4. Exit node(s) approved in the Tailscale admin console at
+#      https://login.tailscale.com/admin/machines (Edit route settings
+#      → Use as exit node).
+#   5. If LAN_ENABLED=true (the default): this router's LAN subnet
+#      route also approved in the Tailscale admin console.
+#   6. End-to-end tested in the GL UI before relying on the slider —
+#      enable Tailscale, select the exit node, confirm your LAN
+#      clients route through it and the kill switch engages.
+#
 # Install on the router:
 #   wget -q https://raw.githubusercontent.com/RemoteToHome-io/gl-tailscale-fix/main/examples/gl-switch.d/Tailscale.sh -O /etc/gl-switch.d/Tailscale.sh
 #   chmod +x /etc/gl-switch.d/Tailscale.sh
@@ -22,15 +38,18 @@
 # inverted convention (resting position is "off" with Tailscale active),
 # swap the action names in the if/elif branches below.
 #
-# Requires gl-tailscale-fix v1.0.9 or later for the ts-fix RPC.
 # Released under the same terms as gl-tailscale-fix (GPL-3.0).
 
 # --- Configuration ---
 DEFAULT_EXIT_NODE_IP="XX.XX.XX.XX"   # Fallback only — see note above
 
 # GL native settings
-LAN_ENABLED=false                     # Allow Remote Access LAN
-WAN_ENABLED=false                     # Allow Remote Access WAN
+LAN_ENABLED=true                      # Allow Remote Access LAN — required for
+                                      # tailnet peers to reach LAN devices
+                                      # behind this router; subnet route must
+                                      # also be approved in the TS admin console
+WAN_ENABLED=false                     # Allow Remote Access WAN — only needed if
+                                      # advertising this router as an exit node
 
 # gl-tailscale-fix settings — restored on every "on" because the plugin's
 # watchdog tears these down to 0 when Tailscale is disabled.

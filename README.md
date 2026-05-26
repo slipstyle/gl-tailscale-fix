@@ -122,14 +122,18 @@ Drop-in scripts for common integration patterns live in the [`examples/`](exampl
 
 ### Side switch toggle (physical switch on Beryl AX, Slate AX, etc.)
 
-[`examples/gl-switch.d/Tailscale.sh`](examples/gl-switch.d/Tailscale.sh) toggles GL's native Tailscale and the plugin's Kill Switch together when you flip the physical side switch on supported GL.iNet routers. Install on the router:
+[`examples/gl-switch.d/Tailscale.sh`](examples/gl-switch.d/Tailscale.sh) toggles GL's native Tailscale and the plugin's Kill Switch together when you flip the physical side switch on supported GL.iNet routers.
+
+**Prerequisites**: Tailscale should already be configured and working in the GL admin UI before deploying this script — plugin installed, Tailscale bound to your account, at least one Custom Exit Node selected, and exit node + subnet routes approved in the [Tailscale admin console](https://login.tailscale.com/admin/machines). See the [setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide) for the full walkthrough. The script header lists the full prerequisite checklist.
+
+Install on the router:
 
 ```sh
 wget -q https://raw.githubusercontent.com/RemoteToHome-io/gl-tailscale-fix/main/examples/gl-switch.d/Tailscale.sh -O /etc/gl-switch.d/Tailscale.sh
 chmod +x /etc/gl-switch.d/Tailscale.sh
 ```
 
-Then edit the file on the router to set your exit node IP and preferred LAN/WAN access settings. The script handles the enable case explicitly and lets the plugin's watchdog tear down the kill switch automatically when Tailscale is disabled — see comments in the file for the rationale and for instructions on inverting the switch logic if you prefer.
+Then edit the Configuration block at the top of the file to dial in your preferred posture (LAN/WAN access, kill switch, guest routing, etc.). Every "on" flip applies that posture in full. See comments in the file for the rationale on each setting and for instructions on inverting the switch logic if you prefer.
 
 ## Compatibility
 
