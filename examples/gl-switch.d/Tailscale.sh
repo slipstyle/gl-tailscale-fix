@@ -1,35 +1,51 @@
 #!/bin/sh
 #
-# Toggle Tailscale (GL native) + gl-tailscale-fix Kill Switch and related preferences together via the physical side switch on supported GL.iNet routers (Beryl AX, Slate AX, etc.).
+# Toggle Tailscale (GL native) + gl-tailscale-fix Kill Switch and related preferences via
+# the physical side switch on supported GL.iNet routers (Beryl AX, Slate AX, etc.).
 #
 # Prerequisites — verify all of these BEFORE deploying this script:
 #   1. gl-tailscale-fix v1.0.9 or later installed on the router.
-#   2. Tailscale enabled in the GL admin UI at least once and bound to your Tailscale account ("Bind Account" set).
-#   3. A Custom Exit Node selected at least once in the GL UI (so an exit node IP is stored in tailscale.settings.exit_node_ip — the script reuses GL's most recent selection on each "on" flip).
-#   4. Exit node(s) approved in the Tailscale admin console at https://login.tailscale.com/admin/machines (Edit route settings → Use as exit node).
-#   5. If LAN_ENABLED=true (the default): this router's LAN subnet route also approved in the Tailscale admin console.
-#   6. End-to-end tested in the GL UI before relying on the slider — enable Tailscale, select the exit node, confirm your LAN clients route through it and the kill switch engages.
+#   2. Tailscale enabled in the GL admin UI at least once and bound to your Tailscale account
+#      ("Bind Account" set).
+#   3. A Custom Exit Node selected at least once in the GL UI (so an exit node IP is stored in
+#      tailscale.settings.exit_node_ip — the script reuses GL's most recent selection on each
+#      "on" flip).
+#   4. Exit node(s) approved in the Tailscale admin console at
+#      https://login.tailscale.com/admin/machines (Edit route settings → Use as exit node).
+#   5. If LAN_ENABLED=true (the default): this router's LAN subnet route also approved in the
+#      Tailscale admin console.
+#   6. End-to-end tested in the GL UI before relying on the slider — enable Tailscale, select
+#      the exit node, confirm your LAN clients route through it and the kill switch engages.
 #
 # Install on the router:
 #   wget -q https://raw.githubusercontent.com/RemoteToHome-io/gl-tailscale-fix/main/examples/gl-switch.d/Tailscale.sh -O /etc/gl-switch.d/Tailscale.sh
 #   chmod +x /etc/gl-switch.d/Tailscale.sh
 #
-# Then edit the Configuration block below to your preferred posture. Every "on" flip applies that posture in full, so a single edit here locks in your setup across switch toggles.
+# Then edit the Configuration block below to your preferred posture. Every "on" flip applies
+# that posture in full, so a single edit here locks in your setup across switch toggles.
 #
-# Exit-node handling is special: by default the script reuses GL's most recently selected exit node (so changing the selection in the GL UI sticks across toggles). DEFAULT_EXIT_NODE_IP is used only as a fallback on first run, when nothing has been selected yet.
+# Exit-node handling is special: by default the script reuses GL's most recently selected exit
+# node (so changing the selection in the GL UI sticks across toggles). DEFAULT_EXIT_NODE_IP is
+# used only as a fallback on first run, when nothing has been selected yet.
 #
-# By default this script treats slider "on" as "enable Tailscale + apply posture" and slider "off" as "disable everything." If you prefer the inverted convention (resting position is "off" with Tailscale active), swap the action names in the if/elif branches below.
+# By default this script treats slider "on" as "enable Tailscale + apply posture" and slider
+# "off" as "disable everything." If you prefer the inverted convention (resting position is
+# "off" with Tailscale active), swap the action names in the if/elif branches below.
 #
 # Released under the same terms as gl-tailscale-fix (GPL-3.0).
 
 # --- Configuration ---
-DEFAULT_EXIT_NODE_IP="XX.XX.XX.XX"   # Fallback only — used on first run when GL has no exit node selected in UCI
+DEFAULT_EXIT_NODE_IP="XX.XX.XX.XX"   # Fallback only — used on first run when GL has no selection
 
 # GL native settings
-LAN_ENABLED=true                      # Allow Remote Access LAN — required for tailnet peers to reach LAN devices behind this router; subnet route must also be approved in the TS admin console
-WAN_ENABLED=false                     # Allow Remote Access WAN — only needed when advertising this router as an exit node
+# Allow Remote Access LAN — required for tailnet peers to reach LAN devices behind this router.
+# Subnet route must also be approved in the Tailscale admin console for this to take effect.
+LAN_ENABLED=true
+# Allow Remote Access WAN — only needed when advertising this router as an exit node.
+WAN_ENABLED=false
 
-# gl-tailscale-fix preferences — applied on every "on" because the plugin's watchdog tears these down to 0 when Tailscale is disabled.
+# gl-tailscale-fix preferences — applied on every "on" because the plugin's watchdog tears
+# these down to 0 when Tailscale is disabled.
 KILL_SWITCH=true                      # Engage kill switch on enable
 ROUTE_GUEST=false                     # Route guest network through Tailscale
 ADVERTISE_EXIT_NODE=false             # Advertise this router as an exit node
@@ -39,7 +55,8 @@ TAILSCALE_SSH=false                   # Enable Tailscale's ACL-based SSH
 action=$1
 
 if [ "$action" = "on" ]; then
-    # Reuse GL's most recently selected exit node IP; fall back to default only when GL has nothing set (first run or after a manual clear).
+    # Reuse GL's most recently selected exit node IP; fall back to default only when GL has
+    # nothing set (first run or after a manual clear).
     exit_node_ip=$(uci -q get tailscale.settings.exit_node_ip)
     [ -z "$exit_node_ip" ] && exit_node_ip="$DEFAULT_EXIT_NODE_IP"
 
@@ -52,7 +69,10 @@ if [ "$action" = "on" ]; then
     curl -H 'glinet: 1' -s -k http://127.0.0.1/rpc -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":[\"\",\"ts-fix\",\"set_config\",{\"kill_switch\":$KILL_SWITCH,\"route_guest\":$ROUTE_GUEST,\"advertise_exit_node\":$ADVERTISE_EXIT_NODE,\"tailscale_ssh\":$TAILSCALE_SSH}],\"id\":2}"
 
 elif [ "$action" = "off" ]; then
-    # Disable Tailscale via UCI directly, bypassing GL's RPC. This preserves tailscale.settings.exit_node_ip so the next "on" flip reconnects to the same node — calling GL's set_config would clear it. The gl-tailscale-fix watchdog detects the enabled=0 transition and tears down the kill switch routing rules within ~5 seconds.
+    # Disable Tailscale via UCI directly, bypassing GL's RPC. This preserves
+    # tailscale.settings.exit_node_ip so the next "on" flip reconnects to the same node —
+    # calling GL's set_config would clear it. The gl-tailscale-fix watchdog detects the
+    # enabled=0 transition and tears down the kill switch routing rules within ~5 seconds.
     uci set tailscale.settings.enabled='0'
     uci commit tailscale
     /usr/bin/gl_tailscale restart >/dev/null 2>&1 &
