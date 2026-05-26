@@ -122,18 +122,27 @@ Drop-in scripts for common integration patterns live in the [`examples/`](exampl
 
 ### Side switch toggle (physical switch on Beryl AX, Slate AX, etc.)
 
-[`examples/gl-switch.d/Tailscale.sh`](examples/gl-switch.d/Tailscale.sh) toggles GL's native Tailscale and the plugin's Kill Switch together when you flip the physical side switch on supported GL.iNet routers.
+[`examples/gl-switch.d/tailscale.sh`](examples/gl-switch.d/tailscale.sh) toggles GL's native Tailscale and the plugin's Kill Switch together when you flip the physical side switch on supported GL.iNet routers.
 
-**Prerequisites**: Tailscale should already be configured and working in the GL admin UI before deploying this script — plugin installed, Tailscale bound to your account, at least one Custom Exit Node selected, and exit node + subnet routes approved in the [Tailscale admin console](https://login.tailscale.com/admin/machines). No WireGuard or OpenVPN client tunnel should be active on this router for LAN/guest traffic, since competing VPN routing conflicts with Tailscale's exit-node path (details in [Architecture](#architecture)). See the [setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide) for the full walkthrough. The script header lists the full prerequisite checklist.
+**Prerequisites**: Tailscale should already be configured and working in the GL admin UI before deploying this script — plugin installed, Tailscale bound to your account, at least one Custom Exit Node selected, and exit node + subnet routes approved in the [Tailscale admin console](https://login.tailscale.com/admin/machines). Any WireGuard, OpenVPN, or Tor client tunnel managed via the GL admin UI should be disabled before configuring the slider — competing VPN routing conflicts with Tailscale's exit-node path (details in [Architecture](#architecture)). See the [setup guide](https://remotetohome.io/gl-tailscale-fix#setup-guide) for the full walkthrough. The script header lists the full prerequisite checklist.
 
 Install on the router:
 
 ```sh
-wget -q https://raw.githubusercontent.com/RemoteToHome-io/gl-tailscale-fix/main/examples/gl-switch.d/Tailscale.sh -O /etc/gl-switch.d/Tailscale.sh
-chmod +x /etc/gl-switch.d/Tailscale.sh
+wget -q https://raw.githubusercontent.com/RemoteToHome-io/gl-tailscale-fix/main/examples/gl-switch.d/tailscale.sh -O /etc/gl-switch.d/tailscale.sh
+chmod +x /etc/gl-switch.d/tailscale.sh
 ```
 
-Then edit the Configuration block at the top of the file to dial in your preferred posture (LAN/WAN access, kill switch, guest routing, etc.). Every "on" flip applies that posture in full. See comments in the file for the rationale on each setting and for instructions on inverting the switch logic if you prefer.
+Bind the physical slider to this script. The GL admin UI Toggle Button Settings dropdown does not list Tailscale as an option, so the binding must be set via UCI:
+
+```sh
+uci set switch-button.@main[0].func='tailscale'
+uci commit switch-button
+```
+
+This replaces any prior side-switch binding. **Do not open System → Toggle Button Settings in the GL admin UI after this** — that page only knows about its hardcoded function list, so it will display "No Function" (or a stale prior selection) and clicking Apply would overwrite the UCI binding. To unbind cleanly, run `uci set switch-button.@main[0].func='' && uci commit switch-button` from SSH.
+
+Then edit the Configuration block at the top of the file to dial in your preferred posture (LAN/WAN access, kill switch, guest routing, etc.). Every "on" flip applies that posture in full and defensively disables any active WireGuard, OpenVPN, or Tor client. See comments in the file for the rationale on each setting and for instructions on inverting the switch logic if you prefer.
 
 ## Compatibility
 
