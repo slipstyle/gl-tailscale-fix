@@ -6,3 +6,6 @@ docs/
 
 # Benchmark scripts and results (internal test tooling)
 bench/
+
+# Release-prep scratchpads (per-version drafts before publish)
+.v[0-9]*
